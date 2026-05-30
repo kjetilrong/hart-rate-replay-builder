@@ -128,8 +128,12 @@ def create_fit_workout(
     name: str,
     steps: Iterable[FitWorkoutStep],
     sport: int = SPORT_RUNNING,
-    serial_number: int = 0x12345678,
+    serial_number: int | None = None,
+    time_created: datetime | None = None,
 ) -> bytes:
+    if serial_number is None:
+        serial_number = 0x12345678
+
     steps = list(steps)
     workout_name_size = 32
     step_name_size = 16
@@ -156,7 +160,7 @@ def create_fit_workout(
             MANUFACTURER_DEVELOPMENT,
             1,
             serial_number,
-            fit_timestamp(),
+            fit_timestamp(time_created),
         ),
     ))
 
@@ -220,7 +224,8 @@ def create_fit_workout_custom_hr_ranges(
     name: str,
     steps: Iterable[FitCustomHrRangeStep],
     sport: int = SPORT_RUNNING,
-    serial_number: int = 0x1234567B,
+    serial_number: int | None = None,
+    time_created: datetime | None = None,
     fenix3_offset_100: bool = True,
 ) -> bytes:
     """Create a Garmin workout FIT file using custom HR bpm ranges.
@@ -233,6 +238,9 @@ def create_fit_workout_custom_hr_ranges(
     If fenix3_offset_100=False, low/high are stored as raw bpm, but the
     default should remain True for this project.
     """
+    if serial_number is None:
+        serial_number = 0x1234567B
+
     steps = list(steps)
     workout_name_size = 32
     step_name_size = 16
@@ -259,7 +267,7 @@ def create_fit_workout_custom_hr_ranges(
             MANUFACTURER_DEVELOPMENT,
             4,
             serial_number,
-            fit_timestamp(),
+            fit_timestamp(time_created),
         ),
     ))
 
