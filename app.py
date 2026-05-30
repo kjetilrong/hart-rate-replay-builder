@@ -10,7 +10,7 @@ import math
 import re
 import zipfile
 import xml.etree.ElementTree as ET
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -467,16 +467,50 @@ def blocks_to_custom_hr_range_steps(blocks: pd.DataFrame) -> list[FitCustomHrRan
     return steps
 
 
-def create_fit_for_blocks(workout_name: str, blocks: pd.DataFrame, export_mode: str) -> bytes:
-    """Create FIT bytes from blocks using selected Garmin export mode."""
+FIT_IDENTITY_SERIAL_BASE = 0x48525200
+
+
+def derive_fit_identity(
+    sequence_no: int,
+    planned_date: date | None,
+    source_name: str | None,
+) -> tuple[int, datetime]:
+    """Build stable FIT file_id values so Garmin imports each workout distinctly."""
+    serial_number = FIT_IDENTITY_SERIAL_BASE + int(sequence_no)
+    if planned_date is not None:
+        time_created = datetime.combine(planned_date, time(12, 0), tzinfo=timezone.utc)
+    else:
+        # No plan date is rare; keep files distinct within the export operation.
+        time_created = datetime.now(timezone.utc)
+
+    return serial_number, time_created + timedelta(seconds=int(sequence_no))
+
+
+def create_fit_for_blocks(
+    workout_name: str,
+    blocks: pd.DataFrame,
+    export_mode: str,
+    sequence_no: int,
+    planned_date: date | None,
+    source_name: str | None,
+) -> bytes:
+    """Create FIT bytes from blocks using selected Garmin export mode and unique FIT identity."""
+    serial_number, time_created = derive_fit_identity(sequence_no, planned_date, source_name)
     if export_mode.startswith("Fenix 3 custom HR range"):
         return create_fit_workout_custom_hr_ranges(
             workout_name[:31],
             blocks_to_custom_hr_range_steps(blocks),
+            serial_number=serial_number,
+            time_created=time_created,
             fenix3_offset_100=True,
         )
 
-    return create_fit_workout(workout_name[:31], blocks_to_fit_steps(blocks))
+    return create_fit_workout(
+        workout_name[:31],
+        blocks_to_fit_steps(blocks),
+        serial_number=serial_number,
+        time_created=time_created,
+    )
 
 # ---- End Fenix 3 custom HR range export helpers -------------------------------
 
@@ -884,6 +918,8 @@ def build_audit_metadata(
     summary: dict[str, Any],
     zone_model: str,
     fit_export_mode: str,
+    fit_serial_number: int,
+    fit_time_created: datetime,
 ) -> dict[str, Any]:
     return {
         "original_source_filename": item["name"],
@@ -893,6 +929,8 @@ def build_audit_metadata(
         "generated_short_filename": f"{slug}.fit",
         "generated_short_stem": slug,
         "garmin_workout_name": garmin_workout_name,
+        "fit_serial_number": int(fit_serial_number),
+        "fit_time_created": fit_time_created.isoformat(),
         "workout_type": summary["workout_type"],
         "peak_zone": summary["peak_zone"],
         "duration_s": round(float(summary["duration_s"]), 3),
@@ -921,9 +959,27 @@ def build_workout_outputs(
     summary = summarize_workout_shape(blocks, item["duration_s"], zone_model)
     stem = build_short_workout_slug(sequence_no, blocks, item["duration_s"], zone_model)
     workout_name = build_garmin_workout_name(sequence_no, summary["peak_zone"], summary["workout_type"])
-    audit_metadata = build_audit_metadata(item, sequence_no, stem, workout_name, summary, zone_model, fit_export_mode)
+    fit_serial_number, fit_time_created = derive_fit_identity(sequence_no, item.get("new_date"), item.get("name"))
+    audit_metadata = build_audit_metadata(
+        item,
+        sequence_no,
+        stem,
+        workout_name,
+        summary,
+        zone_model,
+        fit_export_mode,
+        fit_serial_number,
+        fit_time_created,
+    )
 
-    fit_bytes = create_fit_for_blocks(workout_name, blocks, fit_export_mode)
+    fit_bytes = create_fit_for_blocks(
+        workout_name,
+        blocks,
+        fit_export_mode,
+        sequence_no,
+        item.get("new_date"),
+        item.get("name"),
+    )
 
     zwo_text = blocks_to_zwo(
         blocks,
@@ -941,6 +997,8 @@ def build_workout_outputs(
         "peak_zone": summary["peak_zone"],
         "workout_type": summary["workout_type"],
         "duration_min_rounded": summary["duration_min_rounded"],
+        "fit_serial_number": fit_serial_number,
+        "fit_time_created": fit_time_created,
         "audit_metadata": audit_metadata,
         "fit_filename": f"{stem}.fit",
         "fit_bytes": fit_bytes,
@@ -1006,6 +1064,8 @@ def build_plan_zip(
                 "fit_export_mode": fit_export_mode,
                 "zone_model": zone_defs[0].get("zone_model", ZONE_MODEL_GARMIN) if zone_defs else ZONE_MODEL_GARMIN,
                 "garmin_workout_name": outputs["workout_name"],
+                "fit_serial_number": int(outputs["fit_serial_number"]),
+                "fit_time_created": outputs["fit_time_created"].isoformat(),
                 "fit_file": f"fit/{outputs['fit_filename']}",
                 "zwo_file": f"zwo/{outputs['zwo_filename']}",
                 "audit_file": f"audit/{outputs['yaml_filename']}",
@@ -1033,6 +1093,8 @@ def build_plan_zip(
                     "zone_model": audit_row["zone_model"],
                     "fit_export_mode": fit_export_mode,
                     "garmin_workout_name": outputs["workout_name"],
+                    "fit_serial_number": int(outputs["fit_serial_number"]),
+                    "fit_time_created": outputs["fit_time_created"].isoformat(),
                 }
             )
 
@@ -1553,6 +1615,8 @@ def main():
     edited_summary = summarize_workout_shape(blocks, edited_duration_s, zone_model)
     edited_stem = build_short_workout_slug(selected_idx + 1, blocks, edited_duration_s, zone_model) + "_edited"
     edited_workout_name = build_garmin_workout_name(selected_idx + 1, edited_summary["peak_zone"], edited_summary["workout_type"])
+    edited_identity_sequence_no = selected_idx + 1 + 10000
+    edited_source_name = f"{selected.get('name')}:edited"
     edited_audit_metadata = build_audit_metadata(
         selected,
         selected_idx + 1,
@@ -1561,9 +1625,17 @@ def main():
         edited_summary,
         zone_model,
         fit_export_mode,
+        *derive_fit_identity(edited_identity_sequence_no, selected.get("new_date"), edited_source_name),
     )
     edited_audit_metadata["edited"] = True
-    edited_fit_bytes = create_fit_for_blocks(edited_workout_name, blocks, fit_export_mode)
+    edited_fit_bytes = create_fit_for_blocks(
+        edited_workout_name,
+        blocks,
+        fit_export_mode,
+        edited_identity_sequence_no,
+        selected.get("new_date"),
+        edited_source_name,
+    )
     st.download_button(
         "Download selected edited Garmin FIT",
         edited_fit_bytes,
