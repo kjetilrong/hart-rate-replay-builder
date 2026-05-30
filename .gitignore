@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.zip
+*.fit
+*.gpx
+*.json
+*.csv
+*.zwo
+.DS_Store
+.streamlit/secrets.toml
