@@ -144,7 +144,7 @@ The stem components are:
 - `peakzone` — the highest zone reached (`blue`/`green`/`yellow`/`red` in miCoach mode, or `z1`–`z5` in Garmin mode).
 - `type` — deterministic workout classification: `test`, `long`, `int`, `tempo`, or `easy`. The priority is `test`, then `long`, then `int`, then `tempo`, then `easy`, so a very long hard workout is named `long` unless it qualifies as a short red/Z5 test.
 
-Garmin FIT workout names are even shorter for Fenix 3 display limits, such as `D01 RED TEST`, `D02 RED INT`, or `D03 Z4 TEMPO`.
+Garmin FIT workout names stay short for Fenix 3 display limits while retaining the rounded duration, such as `D01 12MIN RED TEST`, `D02 25MIN RED INT`, or `D03 45MIN Z4 TEMPO`.
 
 Original source filenames and date traceability are preserved in `plan.csv`, `audit.json`, and each YAML audit file rather than in the exported FIT/ZWO filename. Those audit files include the original source filename, original date, planned date, sequence number, generated short filename, workout type, peak zone, duration, selected zone model, and selected FIT export mode.
 

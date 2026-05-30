@@ -805,7 +805,12 @@ def build_short_workout_slug(sequence_no: int, blocks: pd.DataFrame, duration_s:
     return safe_filename_stem(stem)
 
 
-def build_garmin_workout_name(sequence_no: int, peakzone: str, workout_type: str) -> str:
+def build_garmin_workout_name(
+    sequence_no: int,
+    duration_min_rounded: int,
+    peakzone: str,
+    workout_type: str,
+) -> str:
     """Build a compact Fenix-friendly FIT workout name, capped at 31 characters."""
     zone_abbrev = {
         "blue": "BLUE",
@@ -818,7 +823,7 @@ def build_garmin_workout_name(sequence_no: int, peakzone: str, workout_type: str
         "z4": "Z4",
         "z5": "Z5",
     }.get(str(peakzone).lower(), str(peakzone).upper()[:5])
-    name = f"D{int(sequence_no):02d} {zone_abbrev} {str(workout_type).upper()}"
+    name = f"D{int(sequence_no):02d} {int(duration_min_rounded)}MIN {zone_abbrev} {str(workout_type).upper()}"
     return name[:31]
 
 
@@ -958,7 +963,12 @@ def build_workout_outputs(
     zone_model = zone_defs[0].get("zone_model", ZONE_MODEL_GARMIN) if zone_defs else ZONE_MODEL_GARMIN
     summary = summarize_workout_shape(blocks, item["duration_s"], zone_model)
     stem = build_short_workout_slug(sequence_no, blocks, item["duration_s"], zone_model)
-    workout_name = build_garmin_workout_name(sequence_no, summary["peak_zone"], summary["workout_type"])
+    workout_name = build_garmin_workout_name(
+        sequence_no,
+        summary["duration_min_rounded"],
+        summary["peak_zone"],
+        summary["workout_type"],
+    )
     fit_serial_number, fit_time_created = derive_fit_identity(sequence_no, item.get("new_date"), item.get("name"))
     audit_metadata = build_audit_metadata(
         item,
@@ -1614,7 +1624,12 @@ def main():
     edited_duration_s = float(blocks["duration_s"].sum()) if "duration_s" in blocks else float(selected["duration_s"])
     edited_summary = summarize_workout_shape(blocks, edited_duration_s, zone_model)
     edited_stem = build_short_workout_slug(selected_idx + 1, blocks, edited_duration_s, zone_model) + "_edited"
-    edited_workout_name = build_garmin_workout_name(selected_idx + 1, edited_summary["peak_zone"], edited_summary["workout_type"])
+    edited_workout_name = build_garmin_workout_name(
+        selected_idx + 1,
+        edited_summary["duration_min_rounded"],
+        edited_summary["peak_zone"],
+        edited_summary["workout_type"],
+    )
     edited_identity_sequence_no = selected_idx + 1 + 10000
     edited_source_name = f"{selected.get('name')}:edited"
     edited_audit_metadata = build_audit_metadata(
