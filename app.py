@@ -519,19 +519,35 @@ def blocks_to_zwo(blocks: pd.DataFrame, workout_name: str, description: str) -> 
     return "\n".join(lines)
 
 
-def blocks_to_yaml(blocks: pd.DataFrame, workout_name: str, old_hrmax: int, new_hrmax: int, zone_defs: list[dict[str, Any]]) -> str:
+def blocks_to_yaml(
+    blocks: pd.DataFrame,
+    workout_name: str,
+    old_hrmax: int,
+    new_hrmax: int,
+    zone_defs: list[dict[str, Any]],
+    audit_metadata: dict[str, Any] | None = None,
+) -> str:
+    zone_model = zone_defs[0].get('zone_model', ZONE_MODEL_GARMIN) if zone_defs else ZONE_MODEL_GARMIN
     lines = [
         f'name: "{workout_name}"',
         "sport: run",
         "export_policy:",
         "  fit: selected_sidebar_mode",
         "  zwo: power_proxy_for_hr_profile",
-        f"zone_model: {zone_defs[0].get('zone_model', ZONE_MODEL_GARMIN) if zone_defs else ZONE_MODEL_GARMIN}",
+        f"zone_model: {zone_model}",
         "classification_policy: old_bpm_boundaries",
         f"old_hrmax_bpm: {old_hrmax}",
         f"new_hrmax_bpm: {new_hrmax}",
-        "zones:",
     ]
+    if audit_metadata:
+        lines.append("audit_metadata:")
+        for key, value in audit_metadata.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                lines.append(f"  {key}: {value}")
+            else:
+                escaped = str(value).replace('"', '\\"')
+                lines.append(f'  {key}: "{escaped}"')
+    lines.append("zones:")
     for z in zone_defs:
         lines.extend(
             [
@@ -666,6 +682,112 @@ def safe_name(value: str, max_len: int = 64) -> str:
     return (value or "workout")[:max_len]
 
 
+
+
+def safe_filename_stem(value: str, max_len: int = 96) -> str:
+    """Return a lowercase filename stem using only safe portable characters."""
+    value = re.sub(r"[^a-z0-9_.-]+", "_", str(value).lower())
+    value = re.sub(r"_+", "_", value).strip("_.-")
+    return (value or "workout")[:max_len]
+
+
+def _normalized_zone_label(value: Any, zone_model: str) -> str:
+    text = str(value or "").strip().lower()
+    if zone_model == ZONE_MODEL_MICOACH:
+        color_map = {"blue": "blue", "green": "green", "yellow": "yellow", "red": "red"}
+        return color_map.get(text, text)
+
+    m = re.search(r"([1-5])", text)
+    if m:
+        return f"z{m.group(1)}"
+    return text
+
+
+def _zone_rank(zone: str, zone_model: str) -> int:
+    if zone_model == ZONE_MODEL_MICOACH:
+        return {"blue": 1, "green": 2, "yellow": 3, "red": 4}.get(zone, 0)
+    return {"z1": 1, "z2": 2, "z3": 3, "z4": 4, "z5": 5}.get(zone, 0)
+
+
+def summarize_workout_shape(blocks: pd.DataFrame, duration_s: float, zone_model: str) -> dict[str, Any]:
+    """Summarize blocks for short filenames and Garmin workout names."""
+    duration_s = max(0.0, float(duration_s or 0.0))
+    zone_model = zone_model or ZONE_MODEL_GARMIN
+
+    peak_zone = "blue" if zone_model == ZONE_MODEL_MICOACH else "z1"
+    zone_seconds: dict[str, float] = {}
+
+    if not blocks.empty:
+        for _, block in blocks.iterrows():
+            zone = _normalized_zone_label(block.get("zone"), zone_model)
+            seconds = max(0.0, float(block.get("duration_s", 0.0) or 0.0))
+            zone_seconds[zone] = zone_seconds.get(zone, 0.0) + seconds
+            if _zone_rank(zone, zone_model) > _zone_rank(peak_zone, zone_model):
+                peak_zone = zone
+
+    total_for_ratio = duration_s or sum(zone_seconds.values()) or 1.0
+    duration_min = duration_s / 60.0
+
+    if zone_model == ZONE_MODEL_MICOACH:
+        hardest_time = zone_seconds.get("red", 0.0)
+        hard_time = zone_seconds.get("yellow", 0.0) + zone_seconds.get("red", 0.0)
+        tempo_time = zone_seconds.get("green", 0.0) + zone_seconds.get("yellow", 0.0)
+        test_peak = peak_zone == "red"
+    else:
+        hardest_time = zone_seconds.get("z5", 0.0)
+        hard_time = zone_seconds.get("z4", 0.0) + zone_seconds.get("z5", 0.0)
+        tempo_time = zone_seconds.get("z3", 0.0) + zone_seconds.get("z4", 0.0)
+        test_peak = peak_zone == "z5"
+
+    if duration_min <= 30 and test_peak:
+        workout_type = "test"
+    elif duration_min >= 70:
+        workout_type = "long"
+    elif len(blocks) >= 6 or hardest_time >= 0.10 * total_for_ratio or hard_time >= 0.25 * total_for_ratio:
+        workout_type = "int"
+    elif tempo_time >= 0.40 * total_for_ratio:
+        workout_type = "tempo"
+    else:
+        workout_type = "easy"
+
+    return {
+        "duration_s": duration_s,
+        "duration_min_rounded": int(round(duration_min)),
+        "peak_zone": peak_zone,
+        "workout_type": workout_type,
+        "zone_seconds": zone_seconds,
+    }
+
+
+def build_short_workout_slug(sequence_no: int, blocks: pd.DataFrame, duration_s: float, zone_model: str) -> str:
+    """Build day_<sequence>_<duration>_<peakzone>_<type> filename stem."""
+    summary = summarize_workout_shape(blocks, duration_s, zone_model)
+    stem = (
+        f"day_{int(sequence_no):02d}_"
+        f"{summary['duration_min_rounded']}min_"
+        f"{summary['peak_zone']}_"
+        f"{summary['workout_type']}"
+    )
+    return safe_filename_stem(stem)
+
+
+def build_garmin_workout_name(sequence_no: int, peakzone: str, workout_type: str) -> str:
+    """Build a compact Fenix-friendly FIT workout name, capped at 31 characters."""
+    zone_abbrev = {
+        "blue": "BLUE",
+        "green": "GRN",
+        "yellow": "YEL",
+        "red": "RED",
+        "z1": "Z1",
+        "z2": "Z2",
+        "z3": "Z3",
+        "z4": "Z4",
+        "z5": "Z5",
+    }.get(str(peakzone).lower(), str(peakzone).upper()[:5])
+    name = f"D{int(sequence_no):02d} {zone_abbrev} {str(workout_type).upper()}"
+    return name[:31]
+
+
 def parse_uploaded_workout(uploaded) -> dict[str, Any]:
     data = uploaded.read()
     if uploaded.name.lower().endswith(".gpx"):
@@ -754,6 +876,32 @@ def plan_dataframe(plan: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_audit_metadata(
+    item: dict[str, Any],
+    sequence_no: int,
+    slug: str,
+    garmin_workout_name: str,
+    summary: dict[str, Any],
+    zone_model: str,
+    fit_export_mode: str,
+) -> dict[str, Any]:
+    return {
+        "original_source_filename": item["name"],
+        "original_date": item["original_date"].isoformat(),
+        "planned_date": item["new_date"].isoformat(),
+        "sequence_no": int(sequence_no),
+        "generated_short_filename": f"{slug}.fit",
+        "generated_short_stem": slug,
+        "garmin_workout_name": garmin_workout_name,
+        "workout_type": summary["workout_type"],
+        "peak_zone": summary["peak_zone"],
+        "duration_s": round(float(summary["duration_s"]), 3),
+        "duration_min_rounded": int(summary["duration_min_rounded"]),
+        "zone_model": zone_model,
+        "fit_export_mode": fit_export_mode,
+    }
+
+
 def build_workout_outputs(
     item: dict[str, Any],
     sequence_no: int,
@@ -769,9 +917,13 @@ def build_workout_outputs(
     sampled = resample_track(item["raw"], interval_s, smooth_window, method, old_hrmax)
     blocks = build_blocks(sampled, zone_defs, min_block_s)
 
+    zone_model = zone_defs[0].get("zone_model", ZONE_MODEL_GARMIN) if zone_defs else ZONE_MODEL_GARMIN
+    summary = summarize_workout_shape(blocks, item["duration_s"], zone_model)
+    stem = build_short_workout_slug(sequence_no, blocks, item["duration_s"], zone_model)
+    workout_name = build_garmin_workout_name(sequence_no, summary["peak_zone"], summary["workout_type"])
+    audit_metadata = build_audit_metadata(item, sequence_no, stem, workout_name, summary, zone_model, fit_export_mode)
 
-    workout_name = f"{item['new_date'].strftime('%Y%m%d')}_{sequence_no:02d}_HRZ"
-    fit_bytes = create_fit_for_blocks(workout_name[:31], blocks, fit_export_mode)
+    fit_bytes = create_fit_for_blocks(workout_name, blocks, fit_export_mode)
 
     zwo_text = blocks_to_zwo(
         blocks,
@@ -779,13 +931,17 @@ def build_workout_outputs(
         "Generated from historical HR profile. ZWO is %FTP power proxy, not true HR target.",
     )
 
-    yaml_text = blocks_to_yaml(blocks, workout_name, old_hrmax, new_hrmax, zone_defs)
+    yaml_text = blocks_to_yaml(blocks, workout_name, old_hrmax, new_hrmax, zone_defs, audit_metadata)
 
-    stem = f"{item['new_date'].isoformat()}_{sequence_no:02d}_{safe_name(item['name'].rsplit('.', 1)[0])}"
     return {
         "sampled": sampled,
         "blocks": blocks,
         "workout_name": workout_name,
+        "short_stem": stem,
+        "peak_zone": summary["peak_zone"],
+        "workout_type": summary["workout_type"],
+        "duration_min_rounded": summary["duration_min_rounded"],
+        "audit_metadata": audit_metadata,
         "fit_filename": f"{stem}.fit",
         "fit_bytes": fit_bytes,
         "zwo_filename": f"{stem}.zwo",
@@ -810,8 +966,9 @@ def build_plan_zip(
     buffer = io.BytesIO()
     audit = []
 
+    plan_rows = []
+
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("plan.csv", plan_df.to_csv(index=False))
         z.writestr("zone_definitions.json", json.dumps(zone_defs, indent=2, ensure_ascii=False))
 
         for seq, item in enumerate(plan, start=1):
@@ -831,23 +988,55 @@ def build_plan_zip(
             z.writestr(f"zwo/{outputs['zwo_filename']}", outputs["zwo_text"])
             z.writestr(f"audit/{outputs['yaml_filename']}", outputs["yaml_text"])
 
-            audit.append(
+            audit_row = {
+                "original_file": item["name"],
+                "original_date": item["original_date"].isoformat(),
+                "planned_date": item["new_date"].isoformat(),
+                "new_date": item["new_date"].isoformat(),
+                "sequence_no": int(seq),
+                "generated_short_filename": outputs["fit_filename"],
+                "generated_short_stem": outputs["short_stem"],
+                "workout_type": outputs["workout_type"],
+                "peak_zone": outputs["peak_zone"],
+                "duration_s": item["duration_s"],
+                "duration_min_rounded": outputs["duration_min_rounded"],
+                "pause_days": item["pause_days"],
+                "distance_m": item["distance_m"],
+                "num_steps": int(len(outputs["blocks"])),
+                "fit_export_mode": fit_export_mode,
+                "zone_model": zone_defs[0].get("zone_model", ZONE_MODEL_GARMIN) if zone_defs else ZONE_MODEL_GARMIN,
+                "garmin_workout_name": outputs["workout_name"],
+                "fit_file": f"fit/{outputs['fit_filename']}",
+                "zwo_file": f"zwo/{outputs['zwo_filename']}",
+                "audit_file": f"audit/{outputs['yaml_filename']}",
+            }
+            audit.append(audit_row)
+            plan_rows.append(
                 {
-                    "original_file": item["name"],
+                    "#": seq,
                     "original_date": item["original_date"].isoformat(),
+                    "planned_date": item["new_date"].isoformat(),
                     "new_date": item["new_date"].isoformat(),
-                    "pause_days": item["pause_days"],
+                    "pause_days": "" if item["pause_days"] is None else item["pause_days"],
+                    "duration": format_duration(item["duration_s"]),
                     "duration_s": item["duration_s"],
-                    "distance_m": item["distance_m"],
-                    "num_steps": int(len(outputs["blocks"])),
+                    "duration_min_rounded": outputs["duration_min_rounded"],
+                    "distance_km": round(item["distance_m"] / 1000.0, 2) if item["distance_m"] else None,
+                    "avg_hr": round(item["avg_hr"]) if item["avg_hr"] else None,
+                    "max_hr": round(item["max_hr"]) if item["max_hr"] else None,
+                    "original_source_filename": item["name"],
+                    "file": item["name"],
+                    "generated_short_filename": outputs["fit_filename"],
+                    "generated_short_stem": outputs["short_stem"],
+                    "workout_type": outputs["workout_type"],
+                    "peak_zone": outputs["peak_zone"],
+                    "zone_model": audit_row["zone_model"],
                     "fit_export_mode": fit_export_mode,
-                    "zone_model": zone_defs[0].get("zone_model", ZONE_MODEL_GARMIN) if zone_defs else ZONE_MODEL_GARMIN,
-                    "fit_file": f"fit/{outputs['fit_filename']}",
-                    "zwo_file": f"zwo/{outputs['zwo_filename']}",
-                    "audit_file": f"audit/{outputs['yaml_filename']}",
+                    "garmin_workout_name": outputs["workout_name"],
                 }
             )
 
+        z.writestr("plan.csv", pd.DataFrame(plan_rows).to_csv(index=False))
         z.writestr("audit.json", json.dumps(audit, indent=2, ensure_ascii=False))
 
     return buffer.getvalue()
@@ -1359,12 +1548,26 @@ def main():
 
     
     st.subheader("Export selected edited workout")
-    edited_workout_name = f"{selected['new_date'].strftime('%Y%m%d')}_{safe_name(selected['name'].rsplit('.',1)[0])}_edited"[:31]
+    zone_model = zone_defs[0].get("zone_model", ZONE_MODEL_GARMIN) if zone_defs else ZONE_MODEL_GARMIN
+    edited_duration_s = float(blocks["duration_s"].sum()) if "duration_s" in blocks else float(selected["duration_s"])
+    edited_summary = summarize_workout_shape(blocks, edited_duration_s, zone_model)
+    edited_stem = build_short_workout_slug(selected_idx + 1, blocks, edited_duration_s, zone_model) + "_edited"
+    edited_workout_name = build_garmin_workout_name(selected_idx + 1, edited_summary["peak_zone"], edited_summary["workout_type"])
+    edited_audit_metadata = build_audit_metadata(
+        selected,
+        selected_idx + 1,
+        edited_stem,
+        edited_workout_name,
+        edited_summary,
+        zone_model,
+        fit_export_mode,
+    )
+    edited_audit_metadata["edited"] = True
     edited_fit_bytes = create_fit_for_blocks(edited_workout_name, blocks, fit_export_mode)
     st.download_button(
         "Download selected edited Garmin FIT",
         edited_fit_bytes,
-        file_name=f"{selected['new_date'].isoformat()}_{safe_name(selected['name'].rsplit('.',1)[0])}_edited.fit",
+        file_name=f"{edited_stem}.fit",
         mime="application/octet-stream",
     )
 
@@ -1376,7 +1579,7 @@ def main():
     st.download_button(
         "Download selected edited ZWO",
         edited_zwo_text,
-        file_name=f"{selected['new_date'].isoformat()}_{safe_name(selected['name'].rsplit('.',1)[0])}_edited.zwo",
+        file_name=f"{edited_stem}.zwo",
         mime="application/xml",
     )
 
@@ -1386,11 +1589,12 @@ def main():
         int(old_hrmax),
         int(new_hrmax),
         zone_defs,
+        edited_audit_metadata,
     )
     st.download_button(
         "Download selected edited YAML audit",
         edited_yaml_text,
-        file_name=f"{selected['new_date'].isoformat()}_{safe_name(selected['name'].rsplit('.',1)[0])}_edited.yaml",
+        file_name=f"{edited_stem}.yaml",
         mime="text/yaml",
     )
 

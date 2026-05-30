@@ -117,6 +117,37 @@ Default miCoach mapping:
 
 These defaults are centralized in `MICOACH_ZWO_POWER_DEFAULTS` in `app.py` and are also adjustable in the sidebar.
 
+## Exported workout naming
+
+Exported workout files now use short, Garmin-friendly stems instead of embedding the planned date, original upload filename, or source identifiers:
+
+```text
+day_<sequence>_<duration>_<peakzone>_<type>.fit
+```
+
+Examples:
+
+```text
+day_01_12min_red_test.fit
+day_02_25min_red_int.fit
+day_03_40min_yellow_tempo.fit
+day_04_95min_green_long.fit
+day_05_50min_blue_easy.fit
+```
+
+ZWO and per-workout YAML audit exports use the same stem, for example `day_01_12min_red_test.zwo` and `day_01_12min_red_test.yaml`. Edited selected-workout exports append `_edited` before the extension, for example `day_01_12min_red_test_edited.fit`.
+
+The stem components are:
+
+- `sequence` — two-digit plan order such as `01` or `02`.
+- `duration` — rounded total duration in minutes.
+- `peakzone` — the highest zone reached (`blue`/`green`/`yellow`/`red` in miCoach mode, or `z1`–`z5` in Garmin mode).
+- `type` — deterministic workout classification: `test`, `long`, `int`, `tempo`, or `easy`. The priority is `test`, then `long`, then `int`, then `tempo`, then `easy`, so a very long hard workout is named `long` unless it qualifies as a short red/Z5 test.
+
+Garmin FIT workout names are even shorter for Fenix 3 display limits, such as `D01 RED TEST`, `D02 RED INT`, or `D03 Z4 TEMPO`.
+
+Original source filenames and date traceability are preserved in `plan.csv`, `audit.json`, and each YAML audit file rather than in the exported FIT/ZWO filename. Those audit files include the original source filename, original date, planned date, sequence number, generated short filename, workout type, peak zone, duration, selected zone model, and selected FIT export mode.
+
 ## Export workflows
 
 ### Single-workout export
@@ -152,4 +183,4 @@ Then safely eject/unmount the watch and open the workouts under Training / Worko
 
 ## Important limitation
 
-Garmin workout FIT files are not calendar-scheduled by the file itself. Planned dates are preserved in `plan.csv`, `audit.json`, audit YAML, and filenames.
+Garmin workout FIT files are not calendar-scheduled by the file itself. Planned dates are preserved in `plan.csv`, `audit.json`, and audit YAML; exported workout filenames stay short for easier Garmin/Fenix use.
