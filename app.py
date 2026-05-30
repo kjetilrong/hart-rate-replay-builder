@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-APP_VERSION = "v8-fenix3-custom-hr"
+APP_VERSION = "v9-micoach-zone-mode"
 
 import html
 import io
@@ -18,6 +18,17 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from fit_workout_writer import FitWorkoutStep, FitCustomHrRangeStep, create_fit_workout, create_fit_workout_custom_hr_ranges
+
+ZONE_MODEL_GARMIN = "Garmin Z1-Z5"
+ZONE_MODEL_MICOACH = "miCoach Blue/Green/Yellow/Red"
+
+MICOACH_ZWO_POWER_DEFAULTS = {
+    "Blue": 0.60,
+    "Green": 0.75,
+    "Yellow": 0.90,
+    "Red": 1.05,
+}
+
 
 
 def _parse_iso_time(value: str) -> datetime:
@@ -199,28 +210,65 @@ def resample_track(df: pd.DataFrame, interval_s: int, smooth_window: int, method
     return out
 
 
-def build_zone_defs(z2_bpm: int, z3_bpm: int, z4_bpm: int, z5_bpm: int, old_hrmax: int, new_hrmax: int, zwo_power: dict[int, float]) -> list[dict[str, Any]]:
+def build_zone_defs(
+    z2_bpm: int,
+    z3_bpm: int,
+    z4_bpm: int,
+    z5_bpm: int,
+    old_hrmax: int,
+    new_hrmax: int,
+    zwo_power: dict[int, float],
+) -> list[dict[str, Any]]:
     raw = [
-        ("Z1", 1, 0, z2_bpm),
-        ("Z2", 2, z2_bpm, z3_bpm),
-        ("Z3", 3, z3_bpm, z4_bpm),
-        ("Z4", 4, z4_bpm, z5_bpm),
-        ("Z5", 5, z5_bpm, 999),
+        ("Z1", 1, 0, z2_bpm, float(zwo_power.get(1, 0.45))),
+        ("Z2", 2, z2_bpm, z3_bpm, float(zwo_power.get(2, 0.60))),
+        ("Z3", 3, z3_bpm, z4_bpm, float(zwo_power.get(3, 0.75))),
+        ("Z4", 4, z4_bpm, z5_bpm, float(zwo_power.get(4, 0.90))),
+        ("Z5", 5, z5_bpm, 999, float(zwo_power.get(5, 1.05))),
     ]
+    return build_zone_defs_from_raw(raw, old_hrmax, new_hrmax, ZONE_MODEL_GARMIN)
+
+
+def build_micoach_zone_defs(
+    blue_bpm: int,
+    green_bpm: int,
+    yellow_bpm: int,
+    red_bpm: int,
+    old_hrmax: int,
+    new_hrmax: int,
+    zwo_power: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    powers = {**MICOACH_ZWO_POWER_DEFAULTS, **(zwo_power or {})}
+    raw = [
+        ("Blue", 1, blue_bpm, green_bpm, float(powers["Blue"])),
+        ("Green", 2, green_bpm, yellow_bpm, float(powers["Green"])),
+        ("Yellow", 3, yellow_bpm, red_bpm, float(powers["Yellow"])),
+        ("Red", 4, red_bpm, 999, float(powers["Red"])),
+    ]
+    return build_zone_defs_from_raw(raw, old_hrmax, new_hrmax, ZONE_MODEL_MICOACH)
+
+
+def build_zone_defs_from_raw(
+    raw: list[tuple[str, int, int, int, float]],
+    old_hrmax: int,
+    new_hrmax: int,
+    zone_model: str,
+) -> list[dict[str, Any]]:
     out = []
-    for zone, zone_num, low_bpm, high_bpm in raw:
+    for zone, zone_num, low_bpm, high_bpm, zwo_power in raw:
         low_pct = low_bpm / old_hrmax * 100.0 if low_bpm > 0 else 0.0
         high_pct = high_bpm / old_hrmax * 100.0 if high_bpm < 999 else 100.0
         out.append(
             {
                 "zone": zone,
                 "zone_num": zone_num,
+                "zone_model": zone_model,
                 "low_bpm": low_bpm,
                 "high_bpm": high_bpm,
                 "low_pct": low_pct,
                 "high_pct": high_pct,
                 "new_bpm_reference": pct_to_bpm_range(low_pct, high_pct, new_hrmax),
-                "zwo_power": float(zwo_power.get(zone_num, 0.50)),
+                "zwo_power": float(zwo_power),
             }
         )
     return out
@@ -228,6 +276,8 @@ def build_zone_defs(z2_bpm: int, z3_bpm: int, z4_bpm: int, z5_bpm: int, old_hrma
 
 def zone_from_hr(hr: float | None, zone_defs: list[dict[str, Any]]) -> dict[str, Any]:
     if hr is None or pd.isna(hr):
+        return zone_defs[0]
+    if hr < zone_defs[0]["low_bpm"]:
         return zone_defs[0]
     for z in zone_defs:
         if hr >= z["low_bpm"] and hr < z["high_bpm"]:
@@ -237,9 +287,8 @@ def zone_from_hr(hr: float | None, zone_defs: list[dict[str, Any]]) -> dict[str,
 
 def pct_to_bpm_range(low_pct: float, high_pct: float, hrmax: int) -> str:
     low = int(round(hrmax * low_pct / 100.0))
-    if high_pct >= 100:
-        return f"{low}+ bpm"
-    high = int(round(hrmax * high_pct / 100.0)) - 1
+    high = int(round(hrmax * min(high_pct, 100.0) / 100.0))
+    high = max(low + 1, high)
     return f"{low}-{high} bpm"
 
 
@@ -393,8 +442,7 @@ def blocks_to_custom_hr_range_steps(blocks: pd.DataFrame) -> list[FitCustomHrRan
         duration_s = max(1, int(round(float(b["duration_s"]))))
         low, high = parse_bpm_range(b.get("new_bpm_reference", ""))
 
-        zone_label = str(b.get("zone", "HR"))
-        duration_label = str(b.get("duration", format_duration(duration_s)))
+        zone_label = str(b.get("zone", "HR")).upper()
         name = f"{zone_label} {low}-{high}"
 
         try:
@@ -476,8 +524,9 @@ def blocks_to_yaml(blocks: pd.DataFrame, workout_name: str, old_hrmax: int, new_
         f'name: "{workout_name}"',
         "sport: run",
         "export_policy:",
-        "  fit: garmin_hr_zone_targets",
+        "  fit: selected_sidebar_mode",
         "  zwo: power_proxy_for_hr_profile",
+        f"zone_model: {zone_defs[0].get('zone_model', ZONE_MODEL_GARMIN) if zone_defs else ZONE_MODEL_GARMIN}",
         "classification_policy: old_bpm_boundaries",
         f"old_hrmax_bpm: {old_hrmax}",
         f"new_hrmax_bpm: {new_hrmax}",
@@ -487,7 +536,7 @@ def blocks_to_yaml(blocks: pd.DataFrame, workout_name: str, old_hrmax: int, new_
         lines.extend(
             [
                 f"  - zone: {z['zone']}",
-                f"    garmin_zone_number: {z['zone_num']}",
+                f"    export_zone_number: {z['zone_num']}",
                 f"    old_low_bpm: {z['low_bpm']}",
                 f"    old_high_bpm: {z['high_bpm'] if z['high_bpm'] < 999 else 'open'}",
                 f"    old_low_pct_hrmax: {z['low_pct']:.2f}",
@@ -518,6 +567,10 @@ ZONE_COLORS = {
     "Z3": "rgba(0, 120, 255, 0.12)",
     "Z4": "rgba(255, 170, 0, 0.16)",
     "Z5": "rgba(255, 0, 0, 0.14)",
+    "Blue": "rgba(0, 120, 255, 0.16)",
+    "Green": "rgba(0, 170, 0, 0.16)",
+    "Yellow": "rgba(255, 210, 0, 0.22)",
+    "Red": "rgba(255, 0, 0, 0.16)",
 }
 
 
@@ -558,8 +611,9 @@ def plot_hr_profile(df: pd.DataFrame, zone_defs: list[dict[str, Any]], blocks: p
         )
     )
 
-    for z in zone_defs[1:]:
-        fig.add_hline(y=z["low_bpm"], line_dash="dash", annotation_text=f"{z['zone']} {z['low_bpm']} bpm")
+    for z in zone_defs:
+        if z["low_bpm"] > 0:
+            fig.add_hline(y=z["low_bpm"], line_dash="dash", annotation_text=f"{z['zone']} {z['low_bpm']} bpm")
 
     fig.update_layout(
         height=760,
@@ -787,6 +841,7 @@ def build_plan_zip(
                     "distance_m": item["distance_m"],
                     "num_steps": int(len(outputs["blocks"])),
                     "fit_export_mode": fit_export_mode,
+                    "zone_model": zone_defs[0].get("zone_model", ZONE_MODEL_GARMIN) if zone_defs else ZONE_MODEL_GARMIN,
                     "fit_file": f"fit/{outputs['fit_filename']}",
                     "zwo_file": f"zwo/{outputs['zwo_filename']}",
                     "audit_file": f"audit/{outputs['yaml_filename']}",
@@ -875,8 +930,19 @@ def apply_zone_edit(blocks: pd.DataFrame, row_index: int, zone_label: str, zone_
 
     out.loc[row_index, "zone"] = zdef["zone"]
     out.loc[row_index, "zone_num"] = int(zdef["zone_num"])
+    if "old_bpm_range" in out.columns:
+        high = zdef["high_bpm"]
+        out.loc[row_index, "old_bpm_range"] = f"{zdef['low_bpm']}+ bpm" if high >= 999 else f"{zdef['low_bpm']}-{high-1} bpm"
+    if "target_pct_range" in out.columns:
+        out.loc[row_index, "target_pct_range"] = (
+            f"{zdef['low_pct']:.1f}-{zdef['high_pct']:.1f}% HRmax"
+            if zdef["high_pct"] < 100
+            else f"{zdef['low_pct']:.1f}%+ HRmax"
+        )
     if "new_bpm_reference" in out.columns:
         out.loc[row_index, "new_bpm_reference"] = pct_to_bpm_range(zdef["low_pct"], zdef["high_pct"], new_hrmax)
+    if "zwo_power" in out.columns:
+        out.loc[row_index, "zwo_power"] = float(zdef["zwo_power"])
     return normalize_manual_blocks(out)
 
 
@@ -940,13 +1006,7 @@ def plot_hr_profile_with_manual_blocks(sampled: pd.DataFrame, blocks: pd.DataFra
     fig = go.Figure()
 
     # Zone background spans from blocks.
-    zone_colors = {
-        "Z1": "rgba(180, 180, 180, 0.18)",
-        "Z2": "rgba(80, 180, 80, 0.18)",
-        "Z3": "rgba(80, 140, 220, 0.18)",
-        "Z4": "rgba(230, 170, 40, 0.20)",
-        "Z5": "rgba(230, 80, 80, 0.20)",
-    }
+    zone_colors = ZONE_COLORS
 
     if blocks is not None and not blocks.empty:
         for _, b in blocks.iterrows():
@@ -982,8 +1042,10 @@ def plot_hr_profile_with_manual_blocks(sampled: pd.DataFrame, blocks: pd.DataFra
     )
 
     # HR boundary lines.
-    for z in zone_defs[1:]:
+    for z in zone_defs:
         bpm = old_hrmax * z["low_pct"] / 100.0
+        if bpm <= 0:
+            continue
         fig.add_hline(
             y=bpm,
             line_dash="dash",
@@ -1098,9 +1160,9 @@ def render_manual_block_editor(
 # ---- End manual block editing helpers ---------------------------------------
 
 def main():
-    st.set_page_config(page_title="HR Replay Builder v8", layout="wide")
-    st.title("HR Replay Builder v8 — Fenix 3 custom HR ranges + editable blocks")
-    st.caption("Built on v7.3: multi-file plan, editable blocks, ZWO, and Garmin FIT export with Fenix 3 custom HR bpm ranges.")
+    st.set_page_config(page_title="HR Replay Builder", layout="wide")
+    st.title("HR Replay Builder — Garmin + miCoach zone modes")
+    st.caption("Multi-file plan, editable blocks, ZWO, Garmin FIT export, and Fenix 3 custom HR bpm ranges.")
 
     uploaded_files = st.file_uploader(
         "Upload GPX or trace JSON files",
@@ -1115,7 +1177,10 @@ def main():
 
         st.header("HRmax mapping")
         old_hrmax = st.number_input("Old HRmax for reference/% conversion", min_value=120, max_value=240, value=212, step=1)
-        new_hrmax = st.number_input("Current HRmax for reference only", min_value=120, max_value=240, value=180, step=1)
+        new_hrmax = st.number_input("Current HRmax for target bpm conversion", min_value=120, max_value=240, value=180, step=1)
+
+        st.header("Zone model")
+        zone_model = st.selectbox("Zone model", [ZONE_MODEL_GARMIN, ZONE_MODEL_MICOACH], index=0)
 
         st.header("Analysis")
         interval_s = st.selectbox("Resample interval", [5, 10, 15, 30, 60], index=2)
@@ -1136,30 +1201,56 @@ def main():
         st.caption("Fenix 3 custom mode writes explicit bpm ranges using the +100 encoding you verified on the watch.")
 
         st.header("Zone boundaries in old bpm")
-        st.caption("These classify the old workout. FIT uses Garmin zones. ZWO maps zones to %FTP.")
-        z2_bpm = st.number_input("Z2 starts at bpm", min_value=60, max_value=230, value=140, step=1)
-        z3_bpm = st.number_input("Z3 starts at bpm", min_value=60, max_value=235, value=160, step=1)
-        z4_bpm = st.number_input("Z4 starts at bpm", min_value=60, max_value=240, value=175, step=1)
-        z5_bpm = st.number_input("Z5 starts at bpm", min_value=60, max_value=245, value=190, step=1)
+        st.caption("These classify the old workout. FIT targets convert old bpm → % old HRmax → current bpm.")
+        if zone_model == ZONE_MODEL_MICOACH:
+            blue_bpm = st.number_input("Blue starts at bpm", min_value=60, max_value=230, value=120, step=1)
+            green_bpm = st.number_input("Green starts at bpm", min_value=60, max_value=235, value=145, step=1)
+            yellow_bpm = st.number_input("Yellow starts at bpm", min_value=60, max_value=240, value=165, step=1)
+            red_bpm = st.number_input("Red starts at bpm", min_value=60, max_value=245, value=185, step=1)
+        else:
+            z2_bpm = st.number_input("Z2 starts at bpm", min_value=60, max_value=230, value=140, step=1)
+            z3_bpm = st.number_input("Z3 starts at bpm", min_value=60, max_value=235, value=160, step=1)
+            z4_bpm = st.number_input("Z4 starts at bpm", min_value=60, max_value=240, value=175, step=1)
+            z5_bpm = st.number_input("Z5 starts at bpm", min_value=60, max_value=245, value=190, step=1)
 
         st.header("ZWO %FTP proxy per zone")
         st.caption("Rouvy/ZWO is power based. Tune these until indoor HR response resembles the old profile.")
-        z1_power = st.number_input("Z1 Power", min_value=0.20, max_value=2.00, value=0.45, step=0.01, format="%.2f")
-        z2_power = st.number_input("Z2 Power", min_value=0.20, max_value=2.00, value=0.60, step=0.01, format="%.2f")
-        z3_power = st.number_input("Z3 Power", min_value=0.20, max_value=2.00, value=0.75, step=0.01, format="%.2f")
-        z4_power = st.number_input("Z4 Power", min_value=0.20, max_value=2.00, value=0.90, step=0.01, format="%.2f")
-        z5_power = st.number_input("Z5 Power", min_value=0.20, max_value=2.00, value=1.05, step=0.01, format="%.2f")
+        if zone_model == ZONE_MODEL_MICOACH:
+            blue_power = st.number_input("Blue Power", min_value=0.20, max_value=2.00, value=MICOACH_ZWO_POWER_DEFAULTS["Blue"], step=0.01, format="%.2f")
+            green_power = st.number_input("Green Power", min_value=0.20, max_value=2.00, value=MICOACH_ZWO_POWER_DEFAULTS["Green"], step=0.01, format="%.2f")
+            yellow_power = st.number_input("Yellow Power", min_value=0.20, max_value=2.00, value=MICOACH_ZWO_POWER_DEFAULTS["Yellow"], step=0.01, format="%.2f")
+            red_power = st.number_input("Red Power", min_value=0.20, max_value=2.00, value=MICOACH_ZWO_POWER_DEFAULTS["Red"], step=0.01, format="%.2f")
+        else:
+            z1_power = st.number_input("Z1 Power", min_value=0.20, max_value=2.00, value=0.45, step=0.01, format="%.2f")
+            z2_power = st.number_input("Z2 Power", min_value=0.20, max_value=2.00, value=0.60, step=0.01, format="%.2f")
+            z3_power = st.number_input("Z3 Power", min_value=0.20, max_value=2.00, value=0.75, step=0.01, format="%.2f")
+            z4_power = st.number_input("Z4 Power", min_value=0.20, max_value=2.00, value=0.90, step=0.01, format="%.2f")
+            z5_power = st.number_input("Z5 Power", min_value=0.20, max_value=2.00, value=1.05, step=0.01, format="%.2f")
 
     if not uploaded_files:
         st.info("Upload several GPX files to create a date-preserving replay plan.")
         return
 
-    if not (z2_bpm < z3_bpm < z4_bpm < z5_bpm):
-        st.error("Zone boundaries must increase: Z2 < Z3 < Z4 < Z5.")
-        return
-
-    zwo_power = {1: z1_power, 2: z2_power, 3: z3_power, 4: z4_power, 5: z5_power}
-    zone_defs = build_zone_defs(int(z2_bpm), int(z3_bpm), int(z4_bpm), int(z5_bpm), int(old_hrmax), int(new_hrmax), zwo_power)
+    if zone_model == ZONE_MODEL_MICOACH:
+        if not (blue_bpm < green_bpm < yellow_bpm < red_bpm):
+            st.error("miCoach boundaries must increase: Blue < Green < Yellow < Red.")
+            return
+        zwo_power = {"Blue": blue_power, "Green": green_power, "Yellow": yellow_power, "Red": red_power}
+        zone_defs = build_micoach_zone_defs(
+            int(blue_bpm),
+            int(green_bpm),
+            int(yellow_bpm),
+            int(red_bpm),
+            int(old_hrmax),
+            int(new_hrmax),
+            zwo_power,
+        )
+    else:
+        if not (z2_bpm < z3_bpm < z4_bpm < z5_bpm):
+            st.error("Zone boundaries must increase: Z2 < Z3 < Z4 < Z5.")
+            return
+        zwo_power = {1: z1_power, 2: z2_power, 3: z3_power, 4: z4_power, 5: z5_power}
+        zone_defs = build_zone_defs(int(z2_bpm), int(z3_bpm), int(z4_bpm), int(z5_bpm), int(old_hrmax), int(new_hrmax), zwo_power)
 
     parsed: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
@@ -1257,7 +1348,7 @@ def main():
     blocks = render_manual_block_editor(blocks, manual_key, zone_defs, int(new_hrmax), int(min_block_s))
 
     st.subheader("Generated / edited steps for preview")
-    st.caption("FIT uses selected Garmin mode. In Fenix 3 custom mode, blocks export as explicit bpm ranges. ZWO = %FTP power proxy.")
+    st.caption("FIT/ZWO use the selected zone model. In Fenix 3 custom mode, blocks export as explicit bpm ranges. ZWO = %FTP power proxy.")
     st.dataframe(blocks, use_container_width=True, hide_index=True)
 
     with st.expander("Zone definitions"):
@@ -1319,7 +1410,7 @@ def main():
     st.download_button(
         "Download ZIP: full plan (.FIT + .ZWO + audit)",
         plan_zip,
-        file_name=f"hr_replay_v6_plan_{new_start_date.isoformat()}.zip",
+        file_name=f"hr_replay_plan_{new_start_date.isoformat()}.zip",
         mime="application/zip",
     )
 
