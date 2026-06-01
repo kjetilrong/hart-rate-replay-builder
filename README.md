@@ -135,7 +135,7 @@ day_04_95min_green_long.fit
 day_05_50min_blue_easy.fit
 ```
 
-ZWO and per-workout YAML audit exports use the same stem, for example `day_01_12min_red_test.zwo` and `day_01_12min_red_test.yaml`. Edited selected-workout exports append `_edited` before the extension, for example `day_01_12min_red_test_edited.fit`.
+ZWO, voice JSON, and per-workout YAML audit exports use the same stem, for example `day_01_12min_red_test.zwo`, `day_01_12min_red_test.voice.json`, and `day_01_12min_red_test.yaml`. Edited selected-workout exports append `_edited` before the extension, for example `day_01_12min_red_test_edited.fit` or `day_01_12min_red_test_edited.voice.json`.
 
 The stem components are:
 
@@ -147,6 +147,28 @@ The stem components are:
 Garmin FIT workout names stay short for Fenix 3 display limits while retaining the rounded duration, such as `D01 12MIN RED TEST`, `D02 25MIN RED INT`, or `D03 45MIN Z4 TEMPO`.
 
 Original source filenames and date traceability are preserved in `plan.csv`, `audit.json`, and each YAML audit file rather than in the exported FIT/ZWO filename. Those audit files include the original source filename, original date, planned date, sequence number, generated short filename, workout type, peak zone, duration, selected zone model, and selected FIT export mode.
+
+
+## Voice coach JSON export
+
+HR Replay Builder can export a `.voice.json` file for each workout. This format is intended for a future Flutter mobile voice coach app and is deliberately separate from the Garmin FIT workout export. It does not replace Garmin: the watch can still run/log the FIT workout while a phone app reads the voice JSON, connects to a live heart-rate sensor, runs the step timer, and speaks coaching instructions.
+
+The voice JSON contains only Flutter-friendly workout data:
+
+- timed workout steps with integer start/end/duration seconds;
+- current HR target ranges from each block's `new_bpm_reference`;
+- explicit zone labels and zone numbers;
+- a versioned schema with stable `snake_case` field names;
+- arrays of objects such as `zone_summary` and `steps`, instead of maps with dynamic semantic keys;
+- speech messages for step start, HR too low/high, back in range, countdown prompts, next step, and completion.
+
+The schema is designed to be easy to parse with Dart/Flutter using `dart:convert` and plain Dart model classes. A future Flutter app could use packages such as `flutter_blue_plus` for Bluetooth heart-rate sensors and `flutter_tts` for platform text-to-speech, but those packages are not added to this Python repository.
+
+Full-plan ZIP exports include voice files under `voice/`, for example:
+
+```text
+voice/day_01_12min_red_test.voice.json
+```
 
 ## Export workflows
 
@@ -167,6 +189,7 @@ The ZIP contains:
 ```text
 fit/
 zwo/
+voice/
 audit/
 plan.csv
 audit.json

@@ -467,6 +467,228 @@ def blocks_to_custom_hr_range_steps(blocks: pd.DataFrame) -> list[FitCustomHrRan
     return steps
 
 
+def _json_safe(value: Any) -> Any:
+    """Return values that json.dumps can encode without framework-specific types."""
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, bool) or value is None or isinstance(value, (str, int, float)):
+        return value
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _voice_zone_display(zone: Any, zone_model: str) -> str:
+    zone_text = str(zone or "").strip()
+    if zone_model == ZONE_MODEL_MICOACH:
+        return zone_text.upper()
+    return zone_text.upper() if not zone_text.upper().startswith("Z") else zone_text.upper()
+
+
+def _voice_base_messages(zone: str, zone_number: int, low: int, high: int, zone_model: str) -> dict[str, str]:
+    zone_text = str(zone or "").strip()
+    zone_lower = zone_text.lower()
+    if zone_model == ZONE_MODEL_MICOACH:
+        if zone_lower == "blue":
+            return {
+                "start": f"Blue zone. Easy effort. Hold {low} to {high}.",
+                "too_low": "Speed up. Move into blue zone.",
+                "too_high": "Slow down. Return to blue zone.",
+                "back_in_range": "Back in blue zone.",
+            }
+        if zone_lower == "green":
+            return {
+                "start": f"Green zone. Hold steady. Hold {low} to {high}.",
+                "too_low": "Speed up. Move into green zone.",
+                "too_high": "Ease off. Return to green zone.",
+                "back_in_range": "Back in green zone.",
+            }
+        if zone_lower == "yellow":
+            return {
+                "start": f"Yellow zone. Push. Hold {low} to {high}.",
+                "too_low": "Increase effort. Move into yellow zone.",
+                "too_high": "Ease off. Stay controlled.",
+                "back_in_range": "Back in yellow zone.",
+            }
+        if zone_lower == "red":
+            return {
+                "start": f"Red zone. Hard effort. Hold {low} to {high}.",
+                "too_low": "Push harder. Move into red zone.",
+                "too_high": "Ease off slightly. Stay under control.",
+                "back_in_range": "Back in red zone.",
+            }
+
+    return {
+        "start": f"Zone {zone_number}. Hold {low} to {high}.",
+        "too_low": "Speed up. Heart rate too low.",
+        "too_high": "Slow down. Heart rate too high.",
+        "back_in_range": "Back in target range.",
+    }
+
+
+def _voice_next_step_message(next_step: dict[str, Any] | None, zone_model: str) -> str:
+    if next_step is None:
+        return "Workout complete."
+    if zone_model == ZONE_MODEL_MICOACH:
+        return f"Next: {next_step['zone']} zone."
+    return f"Next: {next_step['zone_display']}."
+
+
+def validate_voice_payload(payload: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    if payload.get("schema_name") != "hr_replay_voice_workout":
+        warnings.append("schema_name must be hr_replay_voice_workout")
+    if payload.get("schema_version") != 1:
+        warnings.append("schema_version must be 1")
+
+    steps = payload.get("steps")
+    if not isinstance(steps, list) or not steps:
+        warnings.append("payload must contain at least one step")
+        steps = []
+
+    expected_start = 0
+    for step in steps:
+        if int(step.get("duration_s", 0)) <= 0:
+            warnings.append(f"step {step.get('index')} duration_s must be greater than 0")
+        if int(step.get("hr_low", 0)) >= int(step.get("hr_high", 0)):
+            warnings.append(f"step {step.get('index')} hr_low must be less than hr_high")
+        start_s = int(step.get("start_s", -1))
+        end_s = int(step.get("end_s", -1))
+        if start_s != expected_start:
+            warnings.append(f"step {step.get('index')} start_s is not contiguous")
+        expected_start = end_s
+
+    if steps and int(payload.get("total_duration_s", -1)) != int(steps[-1].get("end_s", -2)):
+        warnings.append("total_duration_s must equal the final step end_s")
+    return warnings
+
+
+def blocks_to_voice_json(
+    blocks: pd.DataFrame,
+    workout_name: str,
+    short_stem: str,
+    zone_model: str,
+    fit_export_mode: str,
+    old_hrmax: int,
+    new_hrmax: int,
+    audit_metadata: dict[str, Any] | None = None,
+) -> str:
+    """Convert already-generated workout blocks to Flutter-friendly voice coach JSON."""
+    safe_audit_metadata = {str(k): _json_safe(v) for k, v in (audit_metadata or {}).items()}
+
+    raw_steps: list[dict[str, Any]] = []
+    cursor_s = 0
+    for _, b in blocks.iterrows():
+        duration_s = max(1, int(round(float(b.get("duration_s", 0)))))
+        start_s = cursor_s
+        end_s = start_s + duration_s
+        cursor_s = end_s
+
+        zone = str(b.get("zone", "Z1"))
+        try:
+            zone_number = int(b.get("zone_num", 1))
+        except Exception:
+            zone_number = 1
+        hr_low, hr_high = parse_bpm_range(b.get("new_bpm_reference", ""))
+        zone_display = _voice_zone_display(zone, zone_model)
+
+        raw_steps.append(
+            {
+                "index": len(raw_steps) + 1,
+                "start_s": int(start_s),
+                "end_s": int(end_s),
+                "duration_s": int(duration_s),
+                "duration_text": format_duration(duration_s),
+                "zone": zone,
+                "zone_display": zone_display,
+                "zone_number": int(zone_number),
+                "hr_low": int(hr_low),
+                "hr_high": int(hr_high),
+                "target_text": f"{int(hr_low)}-{int(hr_high)} bpm",
+                "step_name": f"{zone_display} {int(hr_low)}-{int(hr_high)}",
+            }
+        )
+
+    steps: list[dict[str, Any]] = []
+    for i, step in enumerate(raw_steps):
+        next_step = raw_steps[i + 1] if i + 1 < len(raw_steps) else None
+        messages = _voice_base_messages(
+            step["zone"],
+            step["zone_number"],
+            step["hr_low"],
+            step["hr_high"],
+            zone_model,
+        )
+        messages.update(
+            {
+                "halfway": "Halfway.",
+                "thirty_seconds_remaining": "Thirty seconds remaining.",
+                "ten_seconds_remaining": "Ten seconds remaining.",
+                "next_step": _voice_next_step_message(next_step, zone_model),
+                "complete": "Workout complete." if next_step is None else "",
+            }
+        )
+        steps.append({**step, "messages": messages})
+
+    total_duration_s = int(steps[-1]["end_s"]) if steps else 0
+    zone_totals: dict[str, dict[str, Any]] = {}
+    for step in steps:
+        zone = step["zone"]
+        if zone not in zone_totals:
+            zone_totals[zone] = {
+                "zone": zone,
+                "zone_display": step["zone_display"],
+                "duration_s": 0,
+            }
+        zone_totals[zone]["duration_s"] += int(step["duration_s"])
+
+    zone_summary = []
+    for summary in zone_totals.values():
+        duration_s = int(summary["duration_s"])
+        duration_percent = round((duration_s / total_duration_s * 100.0), 1) if total_duration_s else 0.0
+        zone_summary.append({**summary, "duration_s": duration_s, "duration_percent": duration_percent})
+
+    payload: dict[str, Any] = {
+        "schema_name": "hr_replay_voice_workout",
+        "schema_version": 1,
+        "source": "HR Replay Builder",
+        "name": workout_name,
+        "short_stem": short_stem,
+        "zone_model": zone_model,
+        "fit_export_mode": fit_export_mode,
+        "old_hrmax_bpm": int(old_hrmax),
+        "new_hrmax_bpm": int(new_hrmax),
+        "total_duration_s": total_duration_s,
+        "audit_metadata": safe_audit_metadata,
+        "app_hints": {
+            "intended_client": "flutter",
+            "requires_live_hr": True,
+            "hr_source": "bluetooth_heart_rate_service",
+            "speech_engine": "platform_tts",
+            "timer_mode": "workout_steps",
+        },
+        "voice_settings": {
+            "language": "en",
+            "speak_step_start": True,
+            "speak_halfway": False,
+            "speak_30_seconds_remaining": True,
+            "speak_10_seconds_remaining": False,
+            "speak_too_low": True,
+            "speak_too_high": True,
+            "speak_back_in_range": True,
+            "alert_repeat_seconds": 20,
+            "hr_tolerance_bpm": 0,
+        },
+        "zone_summary": zone_summary,
+        "steps": steps,
+    }
+    payload["validation_warnings"] = validate_voice_payload(payload)
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
 FIT_IDENTITY_SERIAL_BASE = 0x48525200
 
 
@@ -998,6 +1220,16 @@ def build_workout_outputs(
     )
 
     yaml_text = blocks_to_yaml(blocks, workout_name, old_hrmax, new_hrmax, zone_defs, audit_metadata)
+    voice_text = blocks_to_voice_json(
+        blocks,
+        workout_name,
+        stem,
+        zone_model,
+        fit_export_mode,
+        old_hrmax,
+        new_hrmax,
+        audit_metadata,
+    )
 
     return {
         "sampled": sampled,
@@ -1016,6 +1248,8 @@ def build_workout_outputs(
         "zwo_text": zwo_text,
         "yaml_filename": f"{stem}.yaml",
         "yaml_text": yaml_text,
+        "voice_filename": f"{stem}.voice.json",
+        "voice_text": voice_text,
     }
 
 
@@ -1054,6 +1288,7 @@ def build_plan_zip(
             )
             z.writestr(f"fit/{outputs['fit_filename']}", outputs["fit_bytes"])
             z.writestr(f"zwo/{outputs['zwo_filename']}", outputs["zwo_text"])
+            z.writestr(f"voice/{outputs['voice_filename']}", outputs["voice_text"])
             z.writestr(f"audit/{outputs['yaml_filename']}", outputs["yaml_text"])
 
             audit_row = {
@@ -1078,6 +1313,7 @@ def build_plan_zip(
                 "fit_time_created": outputs["fit_time_created"].isoformat(),
                 "fit_file": f"fit/{outputs['fit_filename']}",
                 "zwo_file": f"zwo/{outputs['zwo_filename']}",
+                "voice_file": f"voice/{outputs['voice_filename']}",
                 "audit_file": f"audit/{outputs['yaml_filename']}",
             }
             audit.append(audit_row)
@@ -1105,6 +1341,10 @@ def build_plan_zip(
                     "garmin_workout_name": outputs["workout_name"],
                     "fit_serial_number": int(outputs["fit_serial_number"]),
                     "fit_time_created": outputs["fit_time_created"].isoformat(),
+                    "fit_file": f"fit/{outputs['fit_filename']}",
+                    "zwo_file": f"zwo/{outputs['zwo_filename']}",
+                    "voice_file": f"voice/{outputs['voice_filename']}",
+                    "audit_file": f"audit/{outputs['yaml_filename']}",
                 }
             )
 
@@ -1605,6 +1845,12 @@ def main():
             file_name=outputs["yaml_filename"],
             mime="text/yaml",
         )
+        st.download_button(
+            "Download preview voice JSON",
+            outputs["voice_text"],
+            file_name=outputs["voice_filename"],
+            mime="application/json",
+        )
 
     blocks = render_manual_block_editor(blocks, manual_key, zone_defs, int(new_hrmax), int(min_block_s))
 
@@ -1685,6 +1931,23 @@ def main():
         mime="text/yaml",
     )
 
+    edited_voice_text = blocks_to_voice_json(
+        blocks,
+        edited_workout_name,
+        edited_stem,
+        zone_model,
+        fit_export_mode,
+        int(old_hrmax),
+        int(new_hrmax),
+        edited_audit_metadata,
+    )
+    st.download_button(
+        "Download selected edited voice JSON",
+        edited_voice_text,
+        file_name=f"{edited_stem}.voice.json",
+        mime="application/json",
+    )
+
     st.subheader("Export full plan")
     plan_zip = build_plan_zip(
         plan,
@@ -1699,7 +1962,7 @@ def main():
         fit_export_mode,
     )
     st.download_button(
-        "Download ZIP: full plan (.FIT + .ZWO + audit)",
+        "Download ZIP: full plan (.FIT + .ZWO + voice JSON + audit)",
         plan_zip,
         file_name=f"hr_replay_plan_{new_start_date.isoformat()}.zip",
         mime="application/zip",
